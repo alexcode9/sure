@@ -245,6 +245,34 @@ class EnableBankingItem::ImporterErrorHandlingTest < ActiveSupport::TestCase
     assert_equal [ page1_tx ], result
   end
 
+  test "BancoPosta pages use the accepted fallback date_from and preserve all rows" do
+    enable_banking_account = EnableBankingAccount.new(uid: "test_uid")
+    requested = []
+    start_date = Date.new(2026, 1, 1)
+    corrected = Date.new(2026, 10, 1)
+
+    @mock_provider.expects(:get_account_transactions).twice.with do |params|
+      requested << params
+      true
+    end.returns(
+      { transactions: [ { transaction_id: "first" } ], continuation_key: "cursor", _effective_date_from: corrected },
+      { transactions: [ { transaction_id: "second" } ] }
+    )
+    @importer.expects(:capture_history_window_limited_debug_log).once.with(
+      enable_banking_account, start_date: start_date, effective_date_from: corrected
+    )
+
+    rows = @importer.send(
+      :fetch_paginated_transactions, enable_banking_account,
+      start_date: start_date, transaction_status: "BOOK"
+    )
+
+    assert_equal %w[first second], rows.map { |tx| tx[:transaction_id] }
+    assert_equal start_date, requested.first[:date_from]
+    assert_equal corrected, requested.second[:date_from]
+    assert_equal "cursor", requested.second[:continuation_key]
+  end
+
   # A validation error on the very first page has no prior page to fall back on, so it
   # is a real failure (not ASPSP pagination quirk) and must still propagate.
   test "fetch_paginated_transactions propagates a validation error on the very first page" do
