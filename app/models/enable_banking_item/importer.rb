@@ -1114,6 +1114,9 @@ class EnableBankingItem::Importer
       truncated = false
       continuation_key = nil
       previous_continuation_key = nil
+      # Keep the ASPSP-accepted start date for every page bound to its cursor.
+      effective_date_from = start_date
+      history_window_limited = false
       page_count = 0
       max_pages = strategy.present? ? MAX_LONGEST_PAGINATION_PAGES : MAX_PAGINATION_PAGES
 
@@ -1128,7 +1131,7 @@ class EnableBankingItem::Importer
         begin
           transactions_data = enable_banking_provider.get_account_transactions(
             account_id: enable_banking_account.api_account_id,
-            date_from: start_date,
+            date_from: effective_date_from,
             continuation_key: continuation_key,
             transaction_status: transaction_status,
             psu_headers: psu_headers,
@@ -1168,6 +1171,22 @@ class EnableBankingItem::Importer
           break
         end
 
+        # The provider only adds this internal field after a first-page
+        # WRONG_TRANSACTIONS_PERIOD fallback. A cursor cannot be reused with
+        # different parameters on any subsequent page.
+        if (accepted_date_from = transactions_data[:_effective_date_from]).present?
+          accepted_date_from = accepted_date_from.to_date
+          if continuation_key.present? && accepted_date_from != effective_date_from
+            raise PaginationTruncatedError, "Enable Banking changed date_from during pagination for account #{enable_banking_account.uid}"
+          end
+
+          if accepted_date_from != effective_date_from
+            history_window_limited ||= strategy.present? &&
+              (effective_date_from.nil? || accepted_date_from > effective_date_from)
+            effective_date_from = accepted_date_from
+          end
+        end
+
         transactions = transactions_data[:transactions] || []
         all_transactions.concat(transactions)
 
@@ -1180,6 +1199,17 @@ class EnableBankingItem::Importer
         end
 
         break if continuation_key.blank?
+      end
+
+      if history_window_limited
+        # A successful fallback can still omit older transactions the user
+        # requested. Surface this as a truncated first-time history fetch.
+        capture_longest_truncation_debug_log(
+          enable_banking_account,
+          transactions_kept: all_transactions.count,
+          reason: "ASPSP limited the history start date to #{effective_date_from.iso8601}; earlier transactions may require separate bank consent"
+        ) unless truncated
+        truncated = true
       end
 
       [ all_transactions, truncated ]

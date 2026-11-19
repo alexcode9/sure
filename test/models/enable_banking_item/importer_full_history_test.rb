@@ -37,6 +37,70 @@ class EnableBankingItem::ImporterFullHistoryTest < ActiveSupport::TestCase
     assert_equal Date.new(2020, 1, 1), @requests.first[:date_from]
   end
 
+  test "a bank-adjusted start date is reused on every continuation page and reported as limited history" do
+    @enable_banking_item.update!(sync_start_date: Date.new(2026, 1, 1))
+    link!
+
+    accepted = 89.days.ago.to_date
+    requests = @requests
+    provider = Object.new
+    provider.define_singleton_method(:get_account_balances) { |**| { balances: [] } }
+    provider.define_singleton_method(:get_account_transactions) do |**params|
+      requests << params
+      if params[:continuation_key]
+        unless params[:date_from] == accepted && params[:continuation_key] == "page-2"
+          raise Provider::EnableBanking::EnableBankingError.new(
+            "dateFrom in request is not the same as in continuationKey",
+            :validation_error,
+            response_data: { error: "WRONG_REQUEST_PARAMETERS" }
+          )
+        end
+
+        { transactions: [ {
+          transaction_id: "second", booking_date: (accepted + 1.day).iso8601, status: "BOOK",
+          transaction_amount: { amount: "2.00", currency: "EUR" }, credit_debit_indicator: "DBIT"
+        } ] }
+      else
+        { transactions: [ {
+          transaction_id: "first", booking_date: accepted.iso8601, status: "BOOK",
+          transaction_amount: { amount: "1.00", currency: "EUR" }, credit_debit_indicator: "DBIT"
+        } ], continuation_key: "page-2", _effective_date_from: accepted }
+      end
+    end
+
+    importer = EnableBankingItem::Importer.new(@enable_banking_item, enable_banking_provider: provider)
+    importer.stubs(:fetch_session_data).returns(accounts: [])
+
+    result = importer.import
+
+    assert result[:success]
+    assert_equal 1, result[:transactions_truncated], "a shorter history window must be disclosed"
+    assert_equal 2, @enable_banking_account.reload.raw_transactions_payload.size
+    assert_equal Date.new(2026, 1, 1), requests.first[:date_from]
+    assert_equal accepted, requests.second[:date_from]
+    assert_equal "page-2", requests.second[:continuation_key]
+    assert requests.all? { |r| r[:strategy] == "longest" }
+    assert DebugLogEntry.where(provider_key: "enable_banking", category: "provider_sync_error")
+      .where("message LIKE ?", "%strategy=longest%").exists?
+  end
+
+  test "a first fetch without a start date warns when the ASPSP restricts its history" do
+    link!
+    accepted = 89.days.ago.to_date
+    provider = mock()
+    provider.stubs(:get_account_balances).returns(balances: [])
+    provider.expects(:get_account_transactions).with(has_entries(date_from: nil, strategy: "longest"))
+      .returns(transactions: [], _effective_date_from: accepted)
+
+    importer = EnableBankingItem::Importer.new(@enable_banking_item, enable_banking_provider: provider)
+    importer.stubs(:fetch_session_data).returns(accounts: [])
+
+    result = importer.import
+
+    assert result[:success]
+    assert_equal 1, result[:transactions_truncated]
+  end
+
   test "a future sync_start_date does not push the first fetch past today" do
     @enable_banking_item.update_columns(sync_start_date: 1.day.from_now.to_date)
     link!

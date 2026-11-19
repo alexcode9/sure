@@ -190,9 +190,14 @@ class Provider::EnableBanking
       query: query_params.presence
     )
 
-    handle_response(response)
+    result = handle_response(response)
+    # The continuation key is bound to the effective first-page query, not
+    # the original history start. Tell the importer if an ASPSP shortened it.
+    result[:_effective_date_from] = date_from.to_date if retry_attempt.positive?
+    result
   rescue EnableBankingError => e
-    next_date_from = next_transactions_date_from(e, date_from, retry_attempt)
+    # Never retry with a different date while using an existing continuation key.
+    next_date_from = continuation_key.present? ? nil : next_transactions_date_from(e, date_from, retry_attempt)
 
     if next_date_from
       get_account_transactions(
