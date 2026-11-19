@@ -711,6 +711,28 @@ class EnableBankingItem::Importer
       )
     end
 
+    # A period-restricted API response may return page 1 successfully but omit
+    # earlier history. Warn in the debug UI; no automatic reauthorization can
+    # bypass an ASPSP's historical-consent restriction.
+    def capture_history_window_limited_debug_log(enable_banking_account, start_date:, effective_date_from:)
+      DebugLogEntry.capture(
+        category: "provider_sync_error",
+        level: "warn",
+        message: "Enable Banking limited the transaction history window; earlier movements may need additional bank consent or statement import",
+        source: self.class.name,
+        provider_key: "enable_banking",
+        family: enable_banking_item.family,
+        account_provider: enable_banking_account.account_provider,
+        metadata: {
+          enable_banking_item_id: enable_banking_item.id,
+          enable_banking_account_id: enable_banking_account.id,
+          uid: enable_banking_account.uid,
+          requested_date_from: start_date&.iso8601,
+          effective_date_from: effective_date_from.iso8601
+        }
+      )
+    end
+
     # Surfaces a pagination truncation as a support-visible diagnostic (rather than
     # only a Rails log line) so the /settings/debug UI shows when a sync silently
     # dropped pages beyond a validation error, in case the account ever has more
@@ -1029,6 +1051,7 @@ class EnableBankingItem::Importer
 
     def fetch_paginated_transactions(enable_banking_account, start_date:, transaction_status:, psu_headers: {})
       all_transactions = []
+      effective_date_from = start_date
       continuation_key = nil
       previous_continuation_key = nil
       page_count = 0
@@ -1044,7 +1067,7 @@ class EnableBankingItem::Importer
         begin
           transactions_data = enable_banking_provider.get_account_transactions(
             account_id: enable_banking_account.api_account_id,
-            date_from: start_date,
+            date_from: effective_date_from,
             continuation_key: continuation_key,
             transaction_status: transaction_status,
             psu_headers: psu_headers
@@ -1080,6 +1103,23 @@ class EnableBankingItem::Importer
             error: e
           )
           break
+        end
+
+        # When page one is retried with a bank-accepted date_from, all following
+        # requests must carry that exact date, or the continuation key is invalid.
+        if (accepted_date_from = transactions_data[:_effective_date_from]).present?
+          accepted_date_from = accepted_date_from.to_date
+          if continuation_key.present? && accepted_date_from != effective_date_from
+            raise PaginationTruncatedError, "Enable Banking changed date_from during pagination for account #{enable_banking_account.uid}"
+          end
+
+          if accepted_date_from != effective_date_from
+            Rails.logger.warn "EnableBankingItem::Importer - Bank restricted transaction history for account #{enable_banking_account.uid} to #{accepted_date_from.iso8601}"
+            capture_history_window_limited_debug_log(
+              enable_banking_account, start_date: start_date, effective_date_from: accepted_date_from
+            )
+            effective_date_from = accepted_date_from
+          end
         end
 
         transactions = transactions_data[:transactions] || []
