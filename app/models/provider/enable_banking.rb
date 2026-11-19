@@ -187,9 +187,14 @@ class Provider::EnableBanking
       query: query_params.presence
     )
 
-    handle_response(response)
+    result = handle_response(response)
+    # Continuation keys are tied to the effective query, not the original
+    # requested history start. Pass the accepted date to the importer.
+    result[:_effective_date_from] = date_from.to_date if retry_attempt.positive?
+    result
   rescue EnableBankingError => e
-    next_date_from = next_transactions_date_from(e, date_from, retry_attempt)
+    # Never shorten the date range mid-pagination with an existing cursor.
+    next_date_from = continuation_key.present? ? nil : next_transactions_date_from(e, date_from, retry_attempt)
 
     if next_date_from
       get_account_transactions(

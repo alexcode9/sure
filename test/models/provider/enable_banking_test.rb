@@ -43,6 +43,45 @@ class Provider::EnableBankingTest < ActiveSupport::TestCase
     assert_equal "2026-01-17", requested_queries.second[:date_from]
   end
 
+  test "BancoPosta fallback returns the accepted date_from needed by the next cursor page" do
+    requested_dates = []
+    validation = OpenStruct.new(code: 422, body: {
+      error: "WRONG_TRANSACTIONS_PERIOD", detail: { date_from: "2026-10-01" }
+    }.to_json)
+    success = OpenStruct.new(code: 200, body: { transactions: [], continuation_key: "next" }.to_json)
+
+    Provider::EnableBanking.expects(:get).twice.with do |_url, options|
+      requested_dates << options[:query][:date_from]
+      true
+    end.returns(validation, success)
+
+    result = @provider.get_account_transactions(
+      account_id: "bancoposta", date_from: Date.new(2026, 1, 1), transaction_status: "BOOK"
+    )
+
+    assert_equal Date.new(2026, 10, 1), result[:_effective_date_from]
+    assert_equal "next", result[:continuation_key]
+    assert_equal %w[2026-01-01 2026-10-01], requested_dates
+  end
+
+  test "a period rejection cannot change date_from on a continuation request" do
+    validation = OpenStruct.new(code: 422, body: {
+      error: "WRONG_TRANSACTIONS_PERIOD", detail: { date_from: "2026-10-01" }
+    }.to_json)
+
+    Provider::EnableBanking.expects(:get).once.with do |_url, options|
+      options[:query][:continuation_key] == "cursor" && options[:query][:date_from] == "2026-01-01"
+    end.returns(validation)
+
+    error = assert_raises Provider::EnableBanking::EnableBankingError do
+      @provider.get_account_transactions(
+        account_id: "bancoposta", date_from: Date.new(2026, 1, 1), continuation_key: "cursor"
+      )
+    end
+
+    assert error.wrong_transactions_period?
+  end
+
   test "get_account_transactions falls back to a shorter window when no corrected date_from is given" do
     requested_queries = []
 
