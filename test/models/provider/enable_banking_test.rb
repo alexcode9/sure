@@ -43,6 +43,57 @@ class Provider::EnableBankingTest < ActiveSupport::TestCase
     assert_equal "2026-01-17", requested_queries.second[:date_from]
   end
 
+  test "get_account_transactions exposes the fallback date used to create the continuation key" do
+    requested_queries = []
+    validation = OpenStruct.new(
+      code: 422,
+      body: { error: "WRONG_TRANSACTIONS_PERIOD", detail: { date_from: "2026-10-01" } }.to_json
+    )
+    page = OpenStruct.new(
+      code: 200,
+      body: { transactions: [ { transaction_id: "first" } ], continuation_key: "next" }.to_json
+    )
+
+    Provider::EnableBanking.expects(:get).twice.with do |_url, options|
+      requested_queries << options[:query].dup
+      true
+    end.returns(validation, page)
+
+    result = @provider.get_account_transactions(
+      account_id: "bancoposta",
+      date_from: Date.new(2026, 1, 1),
+      transaction_status: "BOOK",
+      strategy: "longest"
+    )
+
+    assert_equal Date.new(2026, 10, 1), result[:_effective_date_from]
+    assert_equal "next", result[:continuation_key]
+    assert_equal %w[2026-01-01 2026-10-01], requested_queries.map { |query| query[:date_from] }
+    assert_equal [ "longest", "longest" ], requested_queries.map { |query| query[:strategy] }
+  end
+
+  test "get_account_transactions never changes date_from after receiving a continuation key" do
+    validation = OpenStruct.new(
+      code: 422,
+      body: { error: "WRONG_TRANSACTIONS_PERIOD", detail: { date_from: "2026-10-01" } }.to_json
+    )
+    Provider::EnableBanking.expects(:get).once.with do |_url, options|
+      options[:query][:date_from] == "2026-01-01" &&
+        options[:query][:continuation_key] == "bound-to-first-page"
+    end.returns(validation)
+
+    error = assert_raises Provider::EnableBanking::EnableBankingError do
+      @provider.get_account_transactions(
+        account_id: "bancoposta",
+        date_from: Date.new(2026, 1, 1),
+        continuation_key: "bound-to-first-page",
+        transaction_status: "BOOK"
+      )
+    end
+
+    assert error.wrong_transactions_period?
+  end
+
   test "get_account_transactions falls back to a shorter window when no corrected date_from is given" do
     requested_queries = []
 
