@@ -1,4 +1,5 @@
 require "test_helper"
+require "ostruct"
 
 class EnableBankingItem::ImporterFullHistoryTest < ActiveSupport::TestCase
   setup do
@@ -82,6 +83,59 @@ class EnableBankingItem::ImporterFullHistoryTest < ActiveSupport::TestCase
     assert requests.all? { |r| r[:strategy] == "longest" }
     assert DebugLogEntry.where(provider_key: "enable_banking", category: "provider_sync_error")
       .where("message LIKE ?", "%strategy=longest%").exists?
+  end
+
+  test "BancoPosta period fallback preserves date_from on continuation pages end to end" do
+    @enable_banking_item.update!(sync_start_date: Date.new(2026, 1, 1))
+    link!
+
+    accepted = 40.days.ago.to_date
+    requested_queries = []
+    provider = Provider::EnableBanking.allocate
+    provider.stubs(:auth_headers).returns({})
+    provider.stubs(:get_account_balances).returns(balances: [])
+
+    period_error = OpenStruct.new(
+      code: 422,
+      body: {
+        error: "WRONG_TRANSACTIONS_PERIOD",
+        detail: { date_from: accepted.iso8601 }
+      }.to_json
+    )
+    first_page = OpenStruct.new(
+      code: 200,
+      body: {
+        transactions: [ booked_tx("bancoposta-first", accepted.iso8601) ],
+        continuation_key: "bancoposta-cursor"
+      }.to_json
+    )
+    second_page = OpenStruct.new(
+      code: 200,
+      body: {
+        transactions: [ booked_tx("bancoposta-second", (accepted + 1.day).iso8601) ]
+      }.to_json
+    )
+
+    Provider::EnableBanking.expects(:get).times(3).with do |_url, options|
+      requested_queries << options.fetch(:query).dup
+      true
+    end.returns(period_error, first_page, second_page)
+
+    importer = EnableBankingItem::Importer.new(@enable_banking_item, enable_banking_provider: provider)
+    importer.stubs(:fetch_session_data).returns(accounts: [])
+    result = importer.import
+
+    assert result[:success]
+    assert_equal 2, @enable_banking_account.reload.raw_transactions_payload.length
+    assert_equal 1, result[:transactions_truncated], "bank-restricted history must not be presented as complete"
+
+    assert_equal "2026-01-01", requested_queries[0][:date_from]
+    assert_equal accepted.iso8601, requested_queries[1][:date_from]
+    assert_equal accepted.iso8601, requested_queries[2][:date_from],
+      "continuation_key is bound to the accepted fallback date, not the original user date"
+    assert_nil requested_queries[1][:continuation_key]
+    assert_equal "bancoposta-cursor", requested_queries[2][:continuation_key]
+    assert requested_queries.all? { |query| query[:strategy] == "longest" }
   end
 
   test "a first fetch without a start date warns when the ASPSP restricts its history" do
