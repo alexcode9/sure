@@ -250,6 +250,32 @@ class EnableBankingItem::ImporterErrorHandlingTest < ActiveSupport::TestCase
     assert truncated
   end
 
+  test "an incremental fetch keeps the ASPSP-corrected date for its continuation page" do
+    enable_banking_account = EnableBankingAccount.new(uid: "test_uid")
+    requested_dates = []
+    start_date = 90.days.ago.to_date
+    accepted = 60.days.ago.to_date
+
+    @mock_provider.expects(:get_account_transactions).twice.with do |params|
+      requested_dates << params[:date_from]
+      true
+    end.returns(
+      { transactions: [ { transaction_id: "first" } ], continuation_key: "next", _effective_date_from: accepted },
+      { transactions: [ { transaction_id: "second" } ] }
+    )
+
+    transactions, truncated = @importer.send(
+      :fetch_paginated_transactions,
+      enable_banking_account,
+      start_date: start_date,
+      transaction_status: "BOOK"
+    )
+
+    assert_equal [ start_date, accepted ], requested_dates
+    assert_equal %w[first second], transactions.map { |tx| tx[:transaction_id] }
+    assert_not truncated
+  end
+
   # A validation error on the very first page has no prior page to fall back on, so it
   # is a real failure (not ASPSP pagination quirk) and must still propagate.
   test "fetch_paginated_transactions propagates a validation error on the very first page" do
